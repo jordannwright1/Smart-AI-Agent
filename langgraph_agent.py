@@ -175,3 +175,11 @@ def send_email(subject, body, recipient_email):
         return f"✅ Email sent successfully to {recipient_email}!\n**Subject:** {subject}"
     except Exception as e:
         return f"❌ Failed to send email: {str(e)}"
+
+# =====================
+# LANGGRAPH STATE
+# =====================
+class AgentState(TypedDict):
+    messages: List[dict]
+    input: str
+    output: str
