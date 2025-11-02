@@ -324,3 +324,14 @@ Respond naturally.
 # =====================
 def end_node(state: AgentState):
     return state
+
+# =====================
+# GRAPH SETUP
+# =====================
+graph = StateGraph(AgentState)
+graph.add_node("main", main_node)
+graph.add_node("end", end_node)
+graph.set_entry_point("main")
+graph.set_finish_point("end")
+graph.add_edge("main", "end")
+app = graph.compile()
