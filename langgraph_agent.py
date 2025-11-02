@@ -25,3 +25,8 @@ SENDER_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
 st.set_page_config(page_title="Smart AI Agent", layout="wide")
 st.title("🤖 Smart AI Agent")
 st.write("An autonomous Ollama-powered agent that can search, scrape, summarize, and send emails.")
+
+# =====================
+# LLM SETUP
+# =====================
+llm = ChatOllama(model="gemma3:4b", temperature=0.7)
