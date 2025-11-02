@@ -318,3 +318,9 @@ Respond naturally.
     save_memory(messages)
 
     return {"messages": messages, "output": output_text, "input": query}
+
+# =====================
+# END NODE
+# =====================
+def end_node(state: AgentState):
+    return state
