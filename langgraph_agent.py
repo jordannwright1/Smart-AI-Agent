@@ -30,3 +30,29 @@ st.write("An autonomous Ollama-powered agent that can search, scrape, summarize,
 # LLM SETUP
 # =====================
 llm = ChatOllama(model="gemma3:4b", temperature=0.7)
+
+# =====================
+# MEMORY SETUP
+# =====================
+MEMORY_FILE = "conversation_memory.json"
+
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                return []
+            except json.JSONDecodeError:
+                return []
+    return []
+
+def save_memory(memory):
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(memory[-10:], f, ensure_ascii=False, indent=2)
+
+def clear_memory():
+    if os.path.exists(MEMORY_FILE):
+        os.remove(MEMORY_FILE)
+        st.success("🧠 Memory cleared!")
