@@ -183,3 +183,138 @@ class AgentState(TypedDict):
     messages: List[dict]
     input: str
     output: str
+
+# =====================
+# MAIN NODE
+# =====================
+def main_node(state: AgentState):
+    query = state["input"].strip()
+    messages = load_memory()
+    output_text = ""
+
+    # Save user query
+    messages.append({"role": "user", "content": query})
+
+    # Build conversation context for tool decision
+    context = "\n".join([f"{m['role']}: {m['content']}" for m in messages[-5:]])
+
+    # Tool awareness section
+    tool_prompt = f"""
+You are a reasoning engine that decides which tool to use.
+The available tools are:
+- "web_search": for searching the internet (use ONLY when user explicitly asks to search, look up, or find information online).
+- "scrape_url": for extracting and summarizing webpage content (use ONLY when a URL is provided).
+- "send_email": for composing and sending emails (use ONLY when user asks to send an email and provides a recipient).
+
+Here's the recent conversation context:
+{context}
+
+Determine which tools (if any) are needed for this user query.
+IMPORTANT: Return [] (empty list) for:
+- General conversation
+- Memory tasks (remembering information)
+- Questions that can be answered from conversation history
+- Simple requests that don't require external data
+
+Return a JSON list of tools to use (in order), e.g. ["web_search"] or ["scrape_url", "send_email"] or [].
+
+Current user query: {query}
+"""
+    decision_raw = llm.invoke(tool_prompt)
+    decision_text = normalize_output(decision_raw)
+
+    try:
+        # Try to find JSON array in the response
+        json_match = re.findall(r"\[.*?\]", decision_text)
+        if json_match:
+            tools_to_use = json.loads(json_match[0])
+        else:
+            # If no JSON found, default to empty list (no tools)
+            tools_to_use = []
+    except Exception:
+        # On any error, default to no tools
+        tools_to_use = []
+
+    # Identify email recipient and URLs
+    urls = re.findall(r"https?://[^\s]+", query)
+    match_email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", query)
+    recipient_email = match_email.group(0) if match_email else None
+
+    # Initialize collected content
+    collected_info = ""
+
+    # Execute tool chain
+    for tool in tools_to_use:
+        if tool == "web_search":
+            # Use the original user query for search, not the processed query
+            search_summary = web_search(query)
+            collected_info += f"\n\n🔍 Search Results:\n{search_summary}"
+
+        elif tool == "scrape_url" and urls:
+            scrape_summary = scrape_url(urls[0])
+            collected_info += f"\n\n🌐 Scraped Content:\n{scrape_summary}"
+
+        elif tool == "send_email" and recipient_email:
+            email_prompt = f"""
+Recent conversation context:
+{context}
+
+Write one clear, polished email summarizing this information:
+{collected_info or query}
+
+Include both a subject line and body.
+"""
+            result = llm.invoke(email_prompt)
+            ai_output = normalize_output(result)
+            subject, body = extract_subject_and_body(ai_output)
+            email_status = send_email(subject, body, recipient_email)
+            collected_info += f"\n\n{email_status}"
+
+    # If tools were used, generate a contextual response
+    if tools_to_use and collected_info:
+        response_prompt = f"""
+You are a helpful assistant responding to a user query.
+
+Recent conversation context:
+{context}
+
+You searched the web and found this information:
+{collected_info}
+
+Instructions:
+1. Provide a natural, conversational response that addresses the user's query
+2. You may interpret and summarize the search results naturally
+3. CRITICAL: Only reference information that appears in the search results above
+4. Do NOT add facts, companies, articles, or resources that aren't in the search results
+5. If the search results don't fully answer the query, acknowledge this
+6. Keep your response helpful and engaging
+
+Respond naturally while staying grounded in the search results.
+"""
+        result = llm.invoke(response_prompt)
+        contextual_response = normalize_output(result)
+        output_text = f"{contextual_response}\n\n---\n\n**Search Results:**\n{collected_info}"
+
+    # Fallback: no tools triggered → normal conversation
+    if not tools_to_use:
+        context = "\n".join([f"{m['role']}: {m['content']}" for m in messages[-5:]])
+        prompt = f"""
+You are a memory-aware assistant.
+Here's the recent conversation:
+{context}
+
+User just said: "{query}"
+
+Respond naturally.
+"""
+        result = llm.invoke(prompt)
+        collected_info = normalize_output(result)
+        output_text = collected_info
+    
+    # Use output_text if it wasn't set by tool execution
+    if not output_text:
+        output_text = collected_info
+    messages.append({"role": "assistant", "content": output_text})
+    save_memory(messages)
+
+    return {"messages": messages, "output": output_text, "input": query}
