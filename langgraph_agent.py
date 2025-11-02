@@ -335,3 +335,20 @@ graph.set_entry_point("main")
 graph.set_finish_point("end")
 graph.add_edge("main", "end")
 app = graph.compile()
+
+# =====================
+# STREAMLIT UI
+# =====================
+query = st.text_area("Enter your request:")
+col1, col2 = st.columns(2)
+
+if col1.button("Run Agent"):
+    with st.spinner("Thinking..."):
+        state = {"input": query, "messages": [], "output": ""}
+        result = app.invoke(state)
+        output = result.get("output", "")
+        st.markdown("### 🧠 Agent Output")
+        st.write(output)
+
+if col2.button("Clear Memory"):
+    clear_memory()
