@@ -18,3 +18,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 load_dotenv()
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
+
+# =====================
+# STREAMLIT CONFIG
+# =====================
+st.set_page_config(page_title="Smart AI Agent", layout="wide")
+st.title("🤖 Smart AI Agent")
+st.write("An autonomous Ollama-powered agent that can search, scrape, summarize, and send emails.")
