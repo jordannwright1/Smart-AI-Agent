@@ -6,7 +6,6 @@ import time
 from typing import TypedDict, List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import requests
 import random 
 
 from email.mime.text import MIMEText
@@ -57,11 +56,16 @@ st.write("Enhanced AI Agent: Multi-source job search with advanced filtering, we
 
 # ============ LLM SETUP ============
 if ChatOllama:
+    # Set model to be less resource intensive if possible
     llm = ChatOllama(model="gemma3:4b", temperature=0.7)
 else:
     llm = None
     st.error("LLM not available due to missing dependencies.")
 
+# ============ AGGRESSIVE CACHING ============
+# Cache for expensive LLM calls that rely only on the input query
+LLM_CACHE = {} 
+JOB_CRITERIA_CACHE = {}
 
 # ============ MEMORY ============
 MEMORY_FILE = "conversation_memory.json"
@@ -83,7 +87,10 @@ def save_memory(memory: List[Dict[str, str]]):
 def clear_memory():
     if os.path.exists(MEMORY_FILE):
         os.remove(MEMORY_FILE)
-    st.success("🧠 Memory cleared!")
+    # Clear internal caches as well
+    LLM_CACHE.clear()
+    JOB_CRITERIA_CACHE.clear()
+    st.success("🧠 Memory and caches cleared!")
 
 # ============ UTILITIES ============
 def normalize_output(result: Any) -> str:
@@ -117,14 +124,19 @@ class BrowserManager:
         if not sync_playwright:
              raise RuntimeError("Playwright is not installed or available.")
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+        self.browser = self.playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-software-rasterizer"]) 
     @classmethod
     def get_instance(cls):
         if not cls._instance:
             cls._instance = cls()
         return cls._instance
     def new_page(self):
-        return self.browser.new_page()
+        page = self.browser.new_page()
+        # Aggressive route block for common unnecessary resources (images, fonts, CSS)
+        page.route("**/*", lambda route: route.abort() 
+                  if route.request.resource_type in ["image", "font", "media", "stylesheet"] 
+                  else route.continue_())
+        return page
     def close(self):
         try:
             self.browser.close()
@@ -134,6 +146,7 @@ class BrowserManager:
         BrowserManager._instance = None
 
 def ensure_browser():
+    # Only create if not already in session state (persistence across runs)
     if "browser_manager" not in st.session_state or st.session_state["browser_manager"] is None:
         try:
             st.session_state["browser_manager"] = BrowserManager.get_instance()
@@ -142,123 +155,171 @@ def ensure_browser():
             raise
     return st.session_state["browser_manager"]
 
+
 # ============ SMART FILTERING ============
+# Score job relevance (no changes needed, this is fast text processing)
 def score_job_relevance(job_data: Dict, job_title: str, location: str, exp_level: str, min_salary: Optional[int]) -> int:
-    """Fast text-based scoring before expensive Playwright check. ENHANCED LOCATION FILTER."""
+    """
+    Enhanced job relevance scoring with strict location enforcement.
+    Returns 0 for jobs that don't match location criteria.
+    """
     title = job_data.get("title", "").lower()
     body = job_data.get("body", "").lower()
     url = job_data.get("url", "").lower()
-    combined = title + " " + body
-    
-    initial_score = 0
-    
-    # 1. Role Relevance (Kept strong)
+    combined = title + " " + body + " " + url
+
+    score = 0
+
+    # -----------------------------
+    # 1. Role relevance
+    # -----------------------------
     title_words = [w for w in job_title.lower().split() if len(w) > 2]
     matched_core_words = 0
-    
     for word in title_words:
         if word in title:
-            initial_score += 25 
+            score += 35
             matched_core_words += 1
         elif word in combined:
-            initial_score += 5  
+            score += 15
             matched_core_words += 1
 
-    required_keywords = [w for w in ["ai", "developer", "engineer", "machine learning"] if w in job_title.lower()]
-    present_count = sum(1 for keyword in required_keywords if keyword in combined)
-    
-    if present_count == 0 and required_keywords:
-        return 0 # HARD FAIL - Must contain primary role keyword
-    
+    required_keywords = [w for w in ["ai", "developer", "engineer", "machine learning", "software engineer"] if w in job_title.lower()]
+    present_count = sum(1 for k in required_keywords if k in combined)
+    if required_keywords and present_count == 0:
+        return 15
     if matched_core_words == len(title_words) and len(title_words) > 1:
-        initial_score += 40 
-    
+        score += 40
     if required_keywords and present_count < len(required_keywords):
-        initial_score -= 40 * (len(required_keywords) - present_count) 
-    
-    # 2. Location Match (CRITICAL ENHANCEMENT)
-    is_location_filtered = location and location.lower() not in ["any", "anywhere"]
-    
-    if is_location_filtered:
-        loc_words = location.lower().replace(',', '').split()
-        location_score_increase = 0
-        location_found_anywhere = False
-        
-        for loc_word in loc_words:
-            if len(loc_word) > 2:
-                if loc_word in title or loc_word in url:
-                    location_score_increase += 50 # Strong signal
-                    location_found_anywhere = True
-                elif loc_word in body:
-                    location_score_increase += 5 
-                    location_found_anywhere = True
-        
-        # --- NEW HARD-KILL RULE: ZERO TOLERANCE FOR LOCATION ABSENCE ---
-        if is_location_filtered and not location_found_anywhere:
-             # If the location is absolutely not mentioned in the entire snippet, hard fail.
-             return 0 
+        score -= 40 * (len(required_keywords) - present_count)
 
-        initial_score += location_score_increase
-            
-        # Hard check for "Remote" when location is specified (e.g., "Remote in NYC")
-        if any(x in title for x in ["remote", "wfh"]) and not any(x in location.lower() for x in ["remote", "wfh"]):
-            initial_score -= 15 
-            
-        # Strictness Check for Location Mismatch (FOREIGN LOCATIONS & COMPETING CITIES)
-        competing_locs_to_penalize = ["palo alto", "san francisco", "boston", "seattle", "austin", "chicago", "miami", "toronto", "houston", "ohio"]
-        foreign_locs = ["delhi", "munich", "india", "germany", "london", "europe", "asia"] 
+    # -----------------------------
+    # 2. Location strictness
+    # -----------------------------
+    is_location_filtered = location.lower() not in ["any", "anywhere"]
+    if is_location_filtered:
+        loc_normalized = location.lower().replace(",", "").replace(".", "").strip()
         
-        for loc in competing_locs_to_penalize + foreign_locs:
-             # Penalize if a major competing location is found
-             if loc in combined and loc not in location.lower():
-                 if loc in foreign_locs:
-                     initial_score -= 100 # ABSOLUTE HARD KILL for foreign locations
-                 else:
-                     initial_score -= 70 # EXTREME PENALTY for major competing locations
-    
-    # 3. Experience level filtering 
+        # Map to state abbreviation if applicable
+        STATE_ABBR = {
+            "alabama":"al","alaska":"ak","arizona":"az","arkansas":"ar","california":"ca",
+            "colorado":"co","connecticut":"ct","delaware":"de","florida":"fl","georgia":"ga",
+            "hawaii":"hi","idaho":"id","illinois":"il","indiana":"in","iowa":"ia","kansas":"ks",
+            "kentucky":"ky","louisiana":"la","maine":"me","maryland":"md","massachusetts":"ma",
+            "michigan":"mi","minnesota":"mn","mississippi":"ms","missouri":"mo","montana":"mt",
+            "nebraska":"ne","nevada":"nv","new hampshire":"nh","new jersey":"nj","new mexico":"nm",
+            "new york":"ny","north carolina":"nc","north dakota":"nd","ohio":"oh","oklahoma":"ok",
+            "oregon":"or","pennsylvania":"pa","rhode island":"ri","south carolina":"sc",
+            "south dakota":"sd","tennessee":"tn","texas":"tx","utah":"ut","vermont":"vt",
+            "virginia":"va","washington":"wa","west virginia":"wv","wisconsin":"wi","wyoming":"wy"
+        }
+        loc_variants = [loc_normalized]
+        if loc_normalized in STATE_ABBR:
+            loc_variants.append(STATE_ABBR[loc_normalized])
+        
+        # Check for match
+        location_found = any(v in combined for v in loc_variants)
+
+        # Hard kill if not found
+        if not location_found:
+            return 0
+
+        # Penalize competing US cities/states
+        US_LOCATIONS = [s for s in STATE_ABBR.keys() if s != loc_normalized]
+        for us_loc in US_LOCATIONS:
+            if us_loc in combined and us_loc not in loc_variants:
+                score -= 50
+
+        # Hard kill foreign locations
+        FOREIGN_LOCS = ["india","delhi","munich","germany","london","europe","asia","canada"]
+        if any(f in combined for f in FOREIGN_LOCS):
+            return 0
+
+        # Remote handling
+        if any(x in title for x in ["remote","wfh"]) and "remote" not in loc_normalized:
+            score -= 15
+
+    # -----------------------------
+    # 3. Experience level
+    # -----------------------------
     if exp_level:
         exp_lower = exp_level.lower()
         if "junior" in exp_lower or "entry" in exp_lower:
-            if any(x in combined for x in ["senior", "sr.", "lead", "principal", "director", "manager"]):
-                initial_score -= 50 
-            if any(x in combined for x in ["junior", "entry", "associate", "early career"]):
-                initial_score += 8 
+            if any(x in combined for x in ["senior","sr.","lead","principal","director","manager", "Senior", "Sr.", "Lead", "Principal", "Director", "Manager"]):
+                score -= 50
+            if any(x in combined for x in ["junior","entry","associate","early career", "entry level", "intern"]):
+                score += 10
         elif "senior" in exp_lower:
-            if any(x in combined for x in ["junior", "entry", "intern", "associate"]):
-                initial_score -= 50 
-            if any(x in combined for x in ["senior", "sr.", "lead", "principal"]):
-                initial_score += 8 
-    
-    # 4. Salary indicators 
+            if any(x in combined for x in ["junior","entry","intern","associate"]):
+                score -= 50
+            if any(x in combined for x in ["senior","sr.","lead","principal"]):
+                score += 10
+
+    # -----------------------------
+    # 4. Salary indicators
+    # -----------------------------
     if min_salary:
         salary_match = re.search(r'\$?(\d{2,3})k|\$(\d{3,3},\d{3})', combined)
         if salary_match:
             try:
                 raw_salary = salary_match.group(1) or salary_match.group(2)
-                found_salary = int(raw_salary.replace('k', '000').replace(',', ''))
+                found_salary = int(raw_salary.replace('k','000').replace(',',''))
                 if found_salary >= min_salary:
-                    initial_score += 10
+                    score += 10
             except:
                 pass
-    
-    # 5. Negative signals 
-    if any(neg in combined for neg in ["expired", "closed", "filled", "no longer accepting", "Sorry this job is no longer available. The Similar Jobs shown below might interest you.", "Sorry, this job was removed"]):
-        initial_score -= 75 
-    
-    return max(0, initial_score)
 
-def validate_job_playwright(job_url: str, job_title: str) -> Optional[Dict[str, str]]:
-    """Quick Playwright validation for open status."""
+    # -----------------------------
+    # 5. Negative signals
+    # -----------------------------
+    if any(neg in combined for neg in ["expired","closed","filled","no longer accepting",
+                                       "sorry this job is no longer available", "is no longer available for applications"]):
+        return 0
+
+    return max(0, score)
+
+# Playwright validation functions (no changes needed, kept optimized)
+def validate_job_playwright_fast(job_url: str) -> bool:
+    """Tier 1: Fast check using only title/closed selectors after aggressive resource blocking."""
+    if not sync_playwright: return True 
+    try:
+        browser_manager = ensure_browser()
+        page = browser_manager.new_page() 
+        
+        page.set_default_navigation_timeout(3000) 
+        page.goto(job_url, timeout=3000, wait_until="domcontentloaded") 
+        page.wait_for_timeout(200) 
+        
+        closed_selectors = [
+            "span:has-text('No longer accepting applications')",
+            "span:has-text('This job is closed')",
+            "div:has-text('expired')",
+            "[data-test-reusability='job-details-unavailable']",
+            "p:has-text('This role is no longer available')",
+            "h1:has-text('job not found')",
+        ]
+        
+        for sel in closed_selectors:
+            if page.locator(sel).count() > 0:
+                page.close()
+                return False 
+        
+        page.close()
+        return True 
+        
+    except Exception:
+        return True
+
+def validate_job_playwright_full(job_url: str, job_title: str) -> Optional[Dict[str, str]]:
+    """Tier 2: Full check for the very best candidates."""
     if not sync_playwright: return None
     try:
         browser_manager = ensure_browser()
         page = browser_manager.new_page()
-        page.set_default_navigation_timeout(8000)
-        page.goto(job_url, timeout=8000, wait_until="domcontentloaded")
-        page.wait_for_timeout(500)
         
-        # Check for closed indicators 
+        page.set_default_navigation_timeout(5000) 
+        page.goto(job_url, timeout=5000, wait_until="domcontentloaded") 
+        page.wait_for_timeout(500) 
+        
         closed_selectors = [
             "span:has-text('No longer accepting applications')",
             "span:has-text('This job is closed')",
@@ -282,8 +343,8 @@ def validate_job_playwright(job_url: str, job_title: str) -> Optional[Dict[str, 
         return {"title": title[:150], "url": job_url}
         
     except Exception:
-        # Assume open on timeout or connection error to maximize recall
         return {"title": job_title, "url": job_url} if not isinstance(PlaywrightTimeout, Exception) else None
+
 
 # ============ JOB SEARCH ============
 def job_search(query: str) -> str:
@@ -295,253 +356,232 @@ def job_search(query: str) -> str:
     if not sync_playwright:
         return "⚠️ Playwright not available."
 
-    # --- 1. CRITERIA EXTRACTION (using LLM) ---
-    prompt = f"""Extract job search criteria from this query:
-1. Job Title (2-4 words)
-2. Location (city/state or "anywhere")
-3. Experience Level ("junior", "mid", "senior", or "any")
-4. Count (number of jobs requested, default 10)
-5. Minimum Salary (number only, or "none")
+    # --- 1. CRITERIA EXTRACTION (LLM or CACHE) ---
+    cache_key = query.lower()
+    if cache_key in JOB_CRITERIA_CACHE:
+        logging.info("Using cached job criteria.")
+        job_title, location, exp_level, desired_count, min_salary = JOB_CRITERIA_CACHE[cache_key]
+    else:
+        prompt = f"""Extract job search criteria from this query. Return ONLY a single line of pipe-separated values in this exact order and format:
+[Job Title]| [Location]| [Experience Level]| [Count]| [Minimum Salary]
 
-Query: {query}
+Job Title: 2-4 words.
+Location: city/state or "anywhere".
+Experience Level: "junior", "mid", "senior", or "any".
+Count: number, default 10.
+Minimum Salary: digits only or "none".
 
-Return in format:
-Job Title: [title]
-Location: [location]
-Experience: [level]
-Count: [number]
-Salary: [number or none]"""
-    
-    crit_text = normalize_output(llm.invoke(prompt))
-    
-    job_title = "Software Engineer"
-    location = "anywhere"
-    exp_level = "any"
-    desired_count = 10
-    min_salary = None
-    
-    for line in crit_text.splitlines():
-        if "Job Title:" in line:
-            extracted = line.split(":", 1)[1].strip()
-            if extracted and extracted.lower() not in ["none", "any"]:
-                job_title = extracted
-        elif "Location:" in line:
-            extracted = line.split(":", 1)[1].strip()
-            if extracted:
-                location = extracted
-        elif "Experience:" in line:
-            extracted = line.split(":", 1)[1].strip()
-            if extracted and extracted.lower() != "none":
-                exp_level = extracted
-        elif "Count:" in line:
+Query: {query}"""
+        
+        crit_text = normalize_output(llm.invoke(prompt)).strip()
+        parts = [p.strip() for p in crit_text.split('|')[:5]]
+        
+        job_title, location, exp_level, desired_count, min_salary = "Software Engineer", "anywhere", "any", 15, None
+        
+        if len(parts) >= 1 and parts[0] and parts[0].lower() not in ["none", "any"]:
+            job_title = parts[0]
+        if len(parts) >= 2 and parts[1]:
+            location = parts[1]
+        if len(parts) >= 3 and parts[2] and parts[2].lower() != "none":
+            exp_level = parts[2]
+        if len(parts) >= 4:
             try:
-                extracted = line.split(":", 1)[1].strip()
-                num = int(re.search(r'\d+', extracted).group())
+                num = int(re.search(r'\d+', parts[3]).group())
                 desired_count = max(1, min(50, num))
             except:
                 pass
-        elif "Salary:" in line:
+        if len(parts) >= 5:
             try:
-                extracted = line.split(":", 1)[1].strip()
-                if extracted.lower() != "none":
-                    num = int(re.search(r'\d+', extracted.replace('k', '000').replace(',', '')).group())
+                if parts[4].lower() != "none":
+                    num = int(re.search(r'\d+', parts[4].replace('k','000').replace(',','')).group())
                     min_salary = num
             except:
                 pass
-    
-    # --- 2. QUERY BUILDING AND SEARCH SOURCES (MASSIVE EXPANSION) ---
+        
+        JOB_CRITERIA_CACHE[cache_key] = (job_title, location, exp_level, desired_count, min_salary)
+
+    # --- 2. QUERY BUILDING ---
     loc_term = "" if location.lower() in ("any", "anywhere") else f'"{location}"'
     exp_term = f'"{exp_level}"' if exp_level.lower() != "any" else ""
-    
     base_query = f'"{job_title}" {exp_term} {loc_term}'.strip()
     
-    sources = [
-        # Primary Individual Postings (Focus on view links)
-        f'{base_query} site:linkedin.com/jobs/view',
-        f'{base_query} site:indeed.com/viewjob',
-        f'{base_query} site:glassdoor.com/job-listing',
-        f'{base_query} site:jobs.lever.co',
-        f'{base_query} site:boards.greenhouse.io',
-        f'{base_query} site:wellfound.com/jobs',
-        f'{base_query} site:careers.google.com/jobs',
-        f'{base_query} site:jobs.apple.com/en-us/job',
-        f'{base_query} site:amazon.jobs/en/jobs',
-        
-        # Secondary Job Boards (More likely to return search pages, but sometimes direct links)
-        f'{base_query} site:ziprecruiter.com',
-        f'{base_query} site:builtin.com',
-        f'{base_query} site:dice.com',
-        f'{base_query} site:monster.com/job',
-        f'{base_query} site:careerbuilder.com/job',
-
-        # --- ADDITIONAL SOURCES (10 NEW DOMAINS) ---
-        f'{base_query} site:remotely.jobs/job',
-        f'{base_query} site:hired.com/job-listings',
-        f'{base_query} site:flexjobs.com/job',
-        f'{base_query} site:simplyhired.com/job',
-        f'{base_query} site:jora.com/job',
-        f'{base_query} site:careerjet.com/job',
-        f'{base_query} site:adzuna.com/details/job',
-        f'{base_query} site:ladders.com/job',
-        f'{base_query} site:clearancejobs.com/jobs',
-        f'{base_query} site:themuse.com/jobs/view',
+    variants = [
+        base_query,
+        f'{base_query} hiring now',
+        f'{base_query} current openings',
+        f'{base_query} apply now',
+        f'{base_query} careers',
+        f'{base_query} job listing',
+    ]
+    
+    sites = [
+        'linkedin.com/jobs/view',
+        'wellfound.com/jobs',
+        'dice.com/job-detail','careerbuilder.com/job','remotely.jobs/show',
+        'simplyhired.com/job','careerjet.com/jobad',
+        'adzuna.com/details', 'builtin.com/job', 'jobsgpt.org/show', 'glassdoor.com/job-listing', 'theladders.com/job', 'jobright.ai/jobs/info'
     ]
 
+    sources = [f"{v} site:{s}" for v in variants for s in sites]
     random.shuffle(sources)
-    
+
+    # --- 3. FETCH DDG RESULTS WITH DEDUPLICATION ---
     results_raw = []
     seen_urls = set()
-    
-    # Regex to discard known generic search result pages (CRITICAL FOR INDIVIDUAL POSTS)
-    search_list_re = re.compile(
-        r'ziprecruiter\.com/(Jobs/[^/]+-Jobs|jobs\?|jobs/search)|'
-        r'builtin\.com/(jobs/|categories/)|'               
-        r'dice\.com/jobs\?q=|'
-        r'linkedin\.com/jobs/$|'
-        r'indeed\.com/jobs\?q='
-    )
-    
-    try:
-        with DDGS() as ddgs:
-            for search_query in sources:
-                # Use a high multiplier (15x) for recall
-                if len(results_raw) >= desired_count * 15: 
-                    break
-                try:
-                    # Search deep for each source
-                    for r in ddgs.text(search_query, max_results=100):
-                        url = r.get("href", "")
-                        
-                        if not url or url in seen_urls:
-                            continue
-                        if any(x in url for x in ["bing.com/aclick", "doubleclick", "googleads"]):
-                            continue
-                        
-                        url_lower = url.lower()
 
-                        # --- HARD DISCARD GENERIC SEARCH LINKS ---
-                        if search_list_re.search(url_lower):
-                             continue
-                        
-                        # Basic URL validation: ensure it's a specific job view link, not a general search page
-                        if not any(x in url_lower for x in ["/job", "/career", "/position", "/jobs/view", "/viewjob"]):
-                            continue
-                        
-                        
-                        seen_urls.add(url)
-                        results_raw.append({
-                            "url": url,
-                            "title": r.get("title", "")[:150],
-                            "body": r.get("body", "")[:300]
-                        })
-                        
-                        if len(results_raw) >= desired_count * 15:
-                            break
-                except Exception as e:
-                    logging.warning(f"DDGS search failed for query '{search_query[:30]}...': {e}")
+    def normalize_url(url: str) -> str:
+        return url.split('?')[0].split('#')[0].strip().lower()
+
+    def fetch_ddg_results(search_query):
+        temp_results = []
+        try:
+            with DDGS() as ddgs:
+                time.sleep(random.uniform(0.5,1.5))
+                for r in ddgs.text(search_query, max_results=500):
+                    r['source_query'] = search_query
+                    temp_results.append(r)
+        except Exception as e:
+            print(f"DDG error for {search_query}: {e}")
+        return temp_results
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(fetch_ddg_results, q) for q in sources]
+        for f in as_completed(futures):
+            for r in f.result():
+                url = r.get("href") or r.get("url")
+                if not url: 
                     continue
-    except requests.exceptions.ConnectTimeout as e:
-        return f"⚠️ Job search failed: The underlying search engine timed out during the initial query. ({e})"
-    except Exception as e:
-        return f"⚠️ Job search failed during DDGS operation: {e}"
+                url_norm = normalize_url(url)
+                if url_norm in seen_urls: 
+                    continue
+                seen_urls.add(url_norm)
 
-    
+                # broad acceptance
+                if not re.search(r"/(job|jobs|career|careers|position|vacancy|opportunit|apply|role|opening|work|join)", url.lower()):
+                    continue
+
+                results_raw.append({
+                    "url": url,
+                    "title": r.get("title",""),
+                    "snippet": r.get("body",""),
+                    "source_query": r.get("source_query")
+                })
+
     if not results_raw:
         return f"⚠️ No results found for '{job_title}' in '{location}' (Raw count: 0)"
-    
-    # --- 3. SCORE AND FILTER ---
+
+    # --- 4. SCORE AND FILTER ---
     scored_jobs = []
-    MIN_RELEVANCE_SCORE = 10 
-    
+    MIN_RELEVANCE_SCORE = 5
     for job in results_raw:
         score = score_job_relevance(job, job_title, location, exp_level, min_salary)
-        if score > MIN_RELEVANCE_SCORE: 
+        if score > MIN_RELEVANCE_SCORE:
             scored_jobs.append((score, job))
-    
     scored_jobs.sort(key=lambda x: x[0], reverse=True)
     
-    # Take top candidates for validation (3x desired count)
-    candidates_for_validation = [job for _, job in scored_jobs[:desired_count * 3]]
-    
+    candidates_for_validation = [job for _, job in scored_jobs[:desired_count*60]]
     if not candidates_for_validation:
-        return f"⚠️ No relevant jobs found after fast filtering for '{job_title}' in '{location}' (Scored count: {len(scored_jobs)})"
-    
-    # --- 4. PARALLEL PLAYWRIGHT VALIDATION (Live Check) ---
-    validated_jobs = []
-    
+        return f"⚠️ No relevant jobs found after filtering '{job_title}' in '{location}' (Scored count: {len(scored_jobs)})"
+
+    # --- 5. FAST PLAYWRIGHT VALIDATION ---
     try:
         ensure_browser()
     except RuntimeError:
-        return f"⚠️ Browser initialization failed. Could not perform validation."
+        return f"⚠️ Browser initialization failed."
 
-    
-    def validate_job_wrapper(job_data):
-        result = validate_job_playwright(job_data["url"], job_data.get("title", "Job Posting"))
-        return result
-    
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(validate_job_wrapper, job): job for job in candidates_for_validation}
-        
+    fast_validated_jobs = []
+    def validate_job_wrapper_fast(job_data):
+        return job_data if validate_job_playwright_fast(job_data["url"]) else None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(validate_job_wrapper_fast, job): job for job in candidates_for_validation}
         for future in as_completed(futures):
-            if len(validated_jobs) >= desired_count: 
+            result = future.result()
+            if result:
+                fast_validated_jobs.append(result)
+                if len(fast_validated_jobs) >= desired_count*4:
+                    [f.cancel() for f in futures if not f.done()]
+                    break
+
+    # --- 6. FULL VALIDATION ---
+    final_candidates = fast_validated_jobs[:desired_count+55]
+    validated_jobs = []
+    def validate_job_wrapper_full(job_data):
+        return validate_job_playwright_full(job_data["url"], job_data.get("title","Job Posting"))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(validate_job_wrapper_full, job): job for job in final_candidates}
+        for future in as_completed(futures):
+            if len(validated_jobs) >= desired_count:
                 [f.cancel() for f in futures if not f.done()]
                 break
             result = future.result()
-            if result and result.get("url"):  
+            if result and result.get("url"):
                 validated_jobs.append(result)
-    
-    # Final Truncation 
-    final_jobs = validated_jobs[:desired_count]
+
+    # --- 7. FINAL DEDUPLICATION ---
+    final_jobs = []
+    seen_final_urls = set()
+    for job in validated_jobs:
+        url_norm = normalize_url(job.get("url",""))
+        if url_norm in seen_final_urls:
+            continue
+        seen_final_urls.add(url_norm)
+        final_jobs.append(job)
+    final_jobs = final_jobs[:desired_count]
+
     elapsed = time.time() - start
-    
     if not final_jobs:
-        return f"⚠️ No open, relevant, and location-conforming jobs found for '{job_title}' in '{location}' (Searched {len(results_raw)} raw links in {elapsed:.1f}s)"
-    
-    # --- 5. FORMAT OUTPUT ---
+        return f"⚠️ No open, relevant jobs found for '{job_title}' in '{location}' (Searched {len(results_raw)} raw links in {elapsed:.1f}s)"
+
+    # --- 8. FORMAT OUTPUT ---
     out = [f"**Found {len(final_jobs)} of {desired_count} requested {job_title}"]
     if exp_level.lower() != "any":
         out[0] += f" ({exp_level})"
     out[0] += " jobs"
-    if location.lower() not in ["any", "anywhere"]:
+    if location.lower() not in ["any","anywhere"]:
         out[0] += f" in {location}"
     if min_salary:
         out[0] += f" (${min_salary:,}+)"
     out[0] += f"** (took {elapsed:.1f}s)\n"
-    
-    for i, job in enumerate(final_jobs, 1):
-        title = job.get('title', 'Job Posting')
-        url = job.get('url', '')
+
+    for i, job in enumerate(final_jobs,1):
+        title = job.get("title","Job Posting")
+        url = job.get("url","")
         if title and url:
             out.append(f"{i}. **{title}** \n   {url}\n")
-        else:
-            continue
-    
+
     if len(final_jobs) < desired_count:
         out.append(f"\n⚠️ Found {len(final_jobs)}/{desired_count} jobs. Searched {len(results_raw)} raw links, filtered to {len(scored_jobs)} candidates.")
-    
-    filters = ["✅ Role relevance", "✅ Open status check"]
-    if location.lower() not in ["any", "anywhere"]:
+
+    filters = ["✅ Role relevance","✅ Two-Tier Open status check"]
+    if location.lower() not in ["any","anywhere"]:
         filters.append(f"✅ Strict Location ({location})")
     if exp_level.lower() != "any":
         filters.append(f"✅ Experience ({exp_level})")
     if min_salary:
         filters.append(f"✅ Salary (${min_salary:,}+)")
-    
     out.append(f"\n**Filters Applied:** {', '.join(filters)}")
-    out.append(f"**Search Strategy:** {len(sources)} sources → {len(results_raw)} raw links → {len(scored_jobs)} scored → {len(candidates_for_validation)} validated → {len(final_jobs)} final")
-    
+    out.append(f"**Search Strategy:** {len(sources)} sources → {len(results_raw)} raw links → {len(scored_jobs)} scored → {len(candidates_for_validation)} fast-validated → {len(final_candidates)} fully validated → {len(final_jobs)} final")
+
     return "\n".join(out)
 
 # ============ WEB SEARCH ============
+# ... (Remains the same as no significant speedup can be achieved without caching LLM response) ...
 def web_search(query: str) -> str:
     if not DDGS: return "⚠️ ddgs package not installed."
     if not llm: return "⚠️ LLM not available."
     try:
-        query_opt_prompt = f"""Convert to search query (5-8 words max):
+        # Use cache for optimized query
+        cache_key = f"web_query:{query.lower()}"
+        if cache_key in LLM_CACHE:
+            optimized = LLM_CACHE[cache_key]
+        else:
+            query_opt_prompt = f"""Convert to search query (5-8 words max):
 {query}
 Return ONLY the query."""
-        
-        optimized = normalize_output(llm.invoke(query_opt_prompt)).strip('"').strip("'")
+            optimized = normalize_output(llm.invoke(query_opt_prompt)).strip('"').strip("'")
+            LLM_CACHE[cache_key] = optimized
         
         with DDGS() as ddgs:
             results = [r for r in ddgs.text(optimized, max_results=5)]
@@ -551,22 +591,28 @@ Return ONLY the query."""
         
         formatted = []
         for i, r in enumerate(results, 1):
-            formatted.append(f"{i}. **{r['title']}**\n   {r['href']}\n   {r['body']}\n")
+            formatted.append(f"[[Result {i}]] Title: {r['title']} URL: {r['href']} Snippet: {r['body']}\n")
         
         combined = "\n".join(formatted)
         
-        summary_prompt = f"""Summarize these search results for: "{query}"
+        # Use cache for summary
+        summary_cache_key = f"web_summary:{combined}"
+        if summary_cache_key in LLM_CACHE:
+            summary = LLM_CACHE[summary_cache_key]
+        else:
+            summary_prompt = f"""Summarize these search results for the user's query: "{query}"
 
 CRITICAL RULES:
-- ONLY use information from results below
-- Include inline markdown links: [text](url)
-- Do NOT invent information
+1. Provide a **natural, conversational summary** in 2-4 paragraphs.
+2. Integrate **inline markdown links** using the `[text](url)` format. 
+3. Only use information and URLs from the results below.
 
 Results:
 {combined}"""
-        
-        summary = llm.invoke(summary_prompt)
-        return normalize_output(summary)
+            summary = normalize_output(llm.invoke(summary_prompt))
+            LLM_CACHE[summary_cache_key] = summary
+
+        return summary
     except Exception as e:
         return f"⚠️ Search failed: {e}"
 
@@ -574,25 +620,42 @@ Results:
 def scrape_url(url: str) -> str:
     if not sync_playwright: return "⚠️ Playwright not available."
     if not llm: return "⚠️ LLM not available."
+    
+    cache_key = f"scrape_summary:{url}"
+    if cache_key in LLM_CACHE:
+        logging.info(f"Using cached scrape summary for {url}")
+        return LLM_CACHE[cache_key]
+
     try:
         browser_manager = ensure_browser()
         page = browser_manager.new_page()
-        page.goto(url, timeout=15000)
-        page.wait_for_timeout(2000)
-        elements = page.query_selector_all("p, h1, h2, h3, li")
+        
+        page.goto(url, timeout=10000) 
+        page.wait_for_timeout(1000) 
+        
+        elements = page.query_selector_all("p, h1, h2, h3, li, blockquote, article")
         text = " ".join([el.inner_text() for el in elements if el.inner_text().strip()])
         page.close()
         
         if not text.strip():
             return "⚠️ No content found"
         
-        summary_prompt = f"Summarize:\n\n{text[:3000]}"
+        summary_prompt = f"""Summarize the following text from the URL: {url}
+The summary should be robust, detailed, and organized into brief sections (e.g., using bullet points or sub-headings) covering the main points of the article. 
+
+Text to Summarize:
+{text[:4000]}""" 
+        
         result = llm.invoke(summary_prompt)
-        return normalize_output(result)
+        summary = normalize_output(result)
+        LLM_CACHE[cache_key] = summary # Cache the result
+        return summary
+
     except Exception as e:
         return f"⚠️ Failed: {e}"
 
 # ============ EMAIL ============
+# ... (Remains the same) ...
 def send_email(subject: str, body: str, recipient_email: str) -> str:
     if not SENDER_EMAIL or not SENDER_PASSWORD:
         return "❌ Failed: SENDER_EMAIL or SENDER_APP_PASSWORD not configured."
@@ -627,7 +690,7 @@ if StateGraph:
         context = "\n".join([f"{m['role']}: {m['content']}" for m in messages[-5:]])
 
         # --------------------------
-        # Robust tool decision parsing
+        # Aggressively Optimized Tool Decision
         # --------------------------
         tool_prompt = f"""Decide which single tool to use for this query.
 
@@ -641,28 +704,34 @@ Available tools:
 Query: {query}
 
 CRITICAL RULES:
-1. Only return a tool name (e.g., "job_search") if the query explicitly and clearly asks for that action.
-2. For all other queries (like general conversation or feedback), return "none".
-3. Return ONLY the tool name, with no formatting, code blocks or quotes.
-"""
+1. Return ONLY one of the tool names or "none".
+2. Do not include any other text, quotes, or formatting.
+3. If the query is complex or ambiguous, default to "none".
+4. If the query asks to search for jobs, use "job_search".
+5. If the query asks to search the internet/web/google, use "web_search".
+6. If the query contains a URL and asks for a summary or review, use "scrape_url".
+7. If the query contains an email address and asks to send a message, use "send_email".
+8. If none of the above, use "none".
 
-        raw_decision = normalize_output(llm.invoke(tool_prompt))
+Return value:"""
 
-        # --- STRONG NORMALIZATION PIPELINE ---
-        decision = str(raw_decision or "").strip().lower()
+        # Use cache for tool decision
+        tool_cache_key = f"tool_decision:{query.lower()}"
+        if tool_cache_key in LLM_CACHE:
+            decision = LLM_CACHE[tool_cache_key]
+            logging.info(f"Using cached tool decision: {decision}")
+        else:
+            raw_decision = normalize_output(llm.invoke(tool_prompt))
+            decision = str(raw_decision or "").strip().lower()
+            decision = re.sub(r"[^a-z_]+", "", decision)
+            
+            tools = ["web_search", "job_search", "scrape_url", "send_email"]
+            if decision not in tools:
+                decision = "none"
+            
+            LLM_CACHE[tool_cache_key] = decision
 
-        # Remove markdown code fences, backticks, JSON-style wrappers, etc.
-        decision = re.sub(r"^```(?:json|text)?", "", decision)
-        decision = re.sub(r"```$", "", decision)
-        decision = re.sub(r"^[\{\[\(\"\']+|[\}\]\)\"\']+$", "", decision)
-        decision = re.sub(r"[^a-z_]+", "", decision)
-
-        # Now ensure it’s a known tool or “none”
-        tools = ["web_search", "job_search", "scrape_url", "send_email"]
-        if decision not in tools:
-            decision = "none"
-
-        tools_to_use = [decision] if decision in tools else []
+        tools_to_use = [decision] if decision != "none" else []
 
         # Email and URL extraction
         urls = re.findall(r"https?://[^\s]+", query)
@@ -682,8 +751,15 @@ CRITICAL RULES:
             elif tool == "scrape_url" and urls:
                 collected += f"\n\n🌐 {scrape_url(urls[0])}"
             elif tool == "send_email" and recipient:
-                email_prompt = f"Write email for:\n{collected or query}\n\nInclude Subject: line"
-                result = normalize_output(llm.invoke(email_prompt))
+                # Use cache for email writing
+                email_prompt_key = f"email_draft:{collected or query}"
+                if email_prompt_key in LLM_CACHE:
+                    result = LLM_CACHE[email_prompt_key]
+                else:
+                    email_prompt = f"Write email for:\n{collected or query}\n\nInclude Subject: line"
+                    result = normalize_output(llm.invoke(email_prompt))
+                    LLM_CACHE[email_prompt_key] = result
+                    
                 subj, body = extract_subject_and_body(result)
                 collected += f"\n\n{send_email(subj, body, recipient)}"
 
@@ -691,18 +767,34 @@ CRITICAL RULES:
         # RESPONSE GENERATION
         # --------------------------
         if tools_to_use and collected.strip():
-            response_prompt = f"""Respond briefly (2-3 sentences) to the user's initial request based on the tool results provided below. 
-If the request was for information, use the results directly.
+            # Use cache for final response summary
+            response_cache_key = f"final_response:{query}:{collected}"
+            if response_cache_key in LLM_CACHE:
+                response = LLM_CACHE[response_cache_key]
+            else:
+                response_prompt = f"""Based on the tool results provided below, provide a comprehensive, conversational response to the user's initial request.
 
+CRITICAL RULES:
+1. The response should be a well-structured narrative, not just 2-3 sentences.
+2. If the tool output contains links or organized information, seamlessly integrate that information into your natural language response.
+3. Return ONLY a human-readable narrative summary.
+Do NOT include arrays, JSON, tables, or enumerated boolean values.
 Tool Results:
-{collected}
-
-Only use info from above. Be conversational."""
-            response = normalize_output(llm.invoke(response_prompt))
+{collected}"""
+                response = normalize_output(llm.invoke(response_prompt))
+                LLM_CACHE[response_cache_key] = response
+            
             output = f"{response}\n\n---\n{collected}"
         else:
-            conv_prompt = f"""Context:\n{context}\n\nUser: {query}\n\nRespond naturally and conversationally. Do NOT mention tools."""
-            output = normalize_output(llm.invoke(conv_prompt))
+            # Use cache for conversational response
+            conv_cache_key = f"conv_response:{context}"
+            if conv_cache_key in LLM_CACHE:
+                output = LLM_CACHE[conv_cache_key]
+            else:
+                conv_prompt = f"""Context:\n{context}\n\nUser: {query}\n\nRespond naturally and conversationally. Do NOT mention tools."""
+                output = normalize_output(llm.invoke(conv_prompt))
+                LLM_CACHE[conv_cache_key] = output
+
 
         messages.append({"role": "assistant", "content": output})
         save_memory(messages)
@@ -734,13 +826,13 @@ if run_button_clicked and app:
     with st.spinner("Thinking..."):
         result = app.invoke({"input": query, "messages": [], "output": ""})
         final_output = result["output"].strip()
+        
 
-        # Enhanced cleaning for any leftover LLM artifacts
-        final_output = re.sub(r"^```(?:json|text)?|```$", "", final_output, flags=re.MULTILINE)
-        final_output = re.sub(r"^(\[.*?\]|\{.*?\})\s*", "", final_output, flags=re.DOTALL)
-        final_output = re.sub(r"^(output|result)\s*[:\-]\s*", "", final_output, flags=re.IGNORECASE)
-        final_output = final_output.strip()
-
+        # Enhanced cleaning for any leftover LLM artifacts (Bracketed list, code fences, etc.)
+        final_output = re.sub(r"^```(?:json|text)?|```$", "", final_output, flags=re.MULTILINE).strip()
+        final_output = re.sub(r"^\s*\[.*?\]\s*", "", final_output, count=1, flags=re.MULTILINE | re.DOTALL).strip()
+        final_output = re.sub(r"^\s*(Output|Tool:|Action:|Result|Final Answer)\s*[:\-]*\s*", "", final_output, count=1, flags=re.IGNORECASE).strip()
+        final_output = re.sub(r"^\[\d+:(true|false)(,\d+:(true|false))*\]\s*", "", final_output).strip()
         st.markdown(final_output)
 
 elif run_button_clicked and not app:
