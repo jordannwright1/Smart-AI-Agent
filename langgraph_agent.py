@@ -51,8 +51,8 @@ SENDER_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
 
 # ============ STREAMLIT SETUP ============
 st.set_page_config(page_title="Smart AI Agent", layout="wide")
-st.title("🤖 Smart LangGraph AI Agent")
-st.write("Enhanced AI Agent: Multi-source job search with advanced filtering, web search and scraping, and sends emails.")
+st.title("🤖 LangGraph AI Agent")
+st.write("Enhanced AI Agent: Multi-source job search with advanced filtering, web search and scraping, and sends emails.  Job search may take 5-6 minutes. Try 'Find 20 AI Engineer positions in NYC'")
 
 # ============ LLM SETUP ============
 if ChatOllama:
@@ -156,128 +156,245 @@ def ensure_browser():
     return st.session_state["browser_manager"]
 
 
+# =========================
+# Helper functions
+# =========================
+
+def flexible_match(job_title: str, title: str) -> bool:
+    # --- normalize ---
+    norm = lambda s: re.sub(r"[^a-z0-9\s]", "", s.lower())
+    title = norm(title)
+    job_title = norm(job_title)
+
+    # --- simple synonym map ---
+    synonyms = {
+        "ai": ["artificial intelligence"],
+        "ml": ["machine learning"],
+        "developer": ["engineer", "programmer", "software developer", "software engineer"],
+        "engineer": ["developer", "programmer"],
+        "scientist": ["researcher"],
+        "fullstack": ["full stack"],
+        "frontend": ["front end"],
+        "backend": ["back end"],
+    }
+
+    # --- exclusion keywords (to filter irrelevant engineering roles) ---
+    exclude_terms = [
+        "civil", "mechanical", "electrical", "structural",
+        "chemical", "industrial", "manufacturing", "automotive",
+        "geotechnical", "environmental", "biomedical",
+        "petroleum", "aerospace"  # optional, remove if you want aerospace jobs
+    ]
+
+    # Exclude if title contains any of these unrelated engineering fields
+    if any(re.search(rf"\b{term}\b", title) for term in exclude_terms):
+        return False
+
+    # --- tokenize and expand synonyms ---
+    tokens = job_title.split()
+    expanded = set(tokens)
+    for t in tokens:
+        if t in synonyms:
+            expanded.update(synonyms[t])
+
+    # --- OR logic ---
+    for tok in expanded:
+        if re.search(rf"\b{re.escape(tok)}\b", title):
+            return True
+
+    return False
+
+
 # ============ SMART FILTERING ============
-# Score job relevance (no changes needed, this is fast text processing)
 def score_job_relevance(job_data: Dict, job_title: str, location: str, exp_level: str, min_salary: Optional[int]) -> int:
     """
-    Enhanced job relevance scoring with strict location enforcement.
-    Returns 0 for jobs that don't match location criteria.
+    Improved scoring: phrase + whole-word matching for title, alias handling,
+    strict experience enforcement when requested, and location enforcement.
     """
-    title = job_data.get("title", "").lower()
-    body = job_data.get("body", "").lower()
-    url = job_data.get("url", "").lower()
-    combined = title + " " + body + " " + url
+    # --- Best-effort text extraction (some results use 'snippet' vs 'body') ---
+    raw_title = job_data.get("title", "") or job_data.get("headline", "")
+    raw_snippet = job_data.get("snippet", "") or job_data.get("body", "") or ""
+    raw_url = job_data.get("url", "") or job_data.get("href", "")
+
+    # Normalize text
+    def norm(s: str) -> str:
+        return re.sub(r"[^\w\s]", " ", (s or "").lower())
+
+    title = norm(raw_title)
+    snippet = norm(raw_snippet)
+    url = norm(raw_url)
+    combined = (title + " " + snippet + " " + url).strip()
+
+    # FLEXIBLE TITLE MATCH (OR logic)
+    # Use the flexible matching helper
+    if not (flexible_match(job_title, title) or flexible_match(job_title, snippet)):
+        return 0
+
+    NEGATIVE_MARKERS = [
+        "expired", "closed", "filled", "no longer accepting", "no longer available",
+        "position has been filled", "sorry this job is no longer available"
+    ]
+    if any(n in combined for n in NEGATIVE_MARKERS):
+        return 0
+
+    # Additional negative patterns for spam/non-job pages
+    SPAM_INDICATORS = [
+        "salary in", "salaries in", "how much does", "average salary",
+        "employment | indeed", "jobs, employment", "job listings |",
+        "hiring ", "jobs in remote", "remote jobs", "jobs |",
+        "career center", "university career", "job board",
+    ]
+
+    # Check title and snippet for spam
+    combined_lower = combined.lower()
+    spam_count = sum(1 for indicator in SPAM_INDICATORS if indicator in combined_lower)
+    if spam_count >= 2:
+        return 0  # Likely a spam/aggregator page
+
+    # Penalize LinkedIn profiles (not job posts)
+    if "linkedin.com/in/" in raw_url:
+        return 0
+
+    # Penalize forum/discussion posts
+    if any(x in raw_url.lower() for x in ["fishbowl", "reddit.com/r/", "quora.com"]):
+        return 0
 
     score = 0
 
-    # -----------------------------
-    # 1. Role relevance
-    # -----------------------------
-    title_words = [w for w in job_title.lower().split() if len(w) > 2]
-    matched_core_words = 0
-    for word in title_words:
-        if word in title:
-            score += 35
-            matched_core_words += 1
-        elif word in combined:
-            score += 15
-            matched_core_words += 1
+    # Require specific job indicators in URL or title
+    job_url_indicators = ["job", "career", "position", "opening", "apply", "work-with-us"]
+    has_job_indicator = any(ind in raw_url.lower() for ind in job_url_indicators)
+    has_title_indicator = any(ind in raw_title.lower() for ind in ["engineer", "developer", "scientist", "role", "position"])
 
-    required_keywords = [w for w in ["ai", "developer", "engineer", "machine learning", "software engineer"] if w in job_title.lower()]
-    present_count = sum(1 for k in required_keywords if k in combined)
-    if required_keywords and present_count == 0:
-        return 15
-    if matched_core_words == len(title_words) and len(title_words) > 1:
-        score += 40
-    if required_keywords and present_count < len(required_keywords):
-        score -= 40 * (len(required_keywords) - present_count)
+    if not (has_job_indicator or has_title_indicator):
+        score -= 50  # Heavy penalty
 
-    # -----------------------------
-    # 2. Location strictness
-    # -----------------------------
-    is_location_filtered = location.lower() not in ["any", "anywhere"]
-    if is_location_filtered:
-        loc_normalized = location.lower().replace(",", "").replace(".", "").strip()
-        
-        # Map to state abbreviation if applicable
-        STATE_ABBR = {
-            "alabama":"al","alaska":"ak","arizona":"az","arkansas":"ar","california":"ca",
-            "colorado":"co","connecticut":"ct","delaware":"de","florida":"fl","georgia":"ga",
-            "hawaii":"hi","idaho":"id","illinois":"il","indiana":"in","iowa":"ia","kansas":"ks",
-            "kentucky":"ky","louisiana":"la","maine":"me","maryland":"md","massachusetts":"ma",
-            "michigan":"mi","minnesota":"mn","mississippi":"ms","missouri":"mo","montana":"mt",
-            "nebraska":"ne","nevada":"nv","new hampshire":"nh","new jersey":"nj","new mexico":"nm",
-            "new york":"ny","north carolina":"nc","north dakota":"nd","ohio":"oh","oklahoma":"ok",
-            "oregon":"or","pennsylvania":"pa","rhode island":"ri","south carolina":"sc",
-            "south dakota":"sd","tennessee":"tn","texas":"tx","utah":"ut","vermont":"vt",
-            "virginia":"va","washington":"wa","west virginia":"wv","wisconsin":"wi","wyoming":"wy"
-        }
-        loc_variants = [loc_normalized]
-        if loc_normalized in STATE_ABBR:
-            loc_variants.append(STATE_ABBR[loc_normalized])
-        
-        # Check for match
-        location_found = any(v in combined for v in loc_variants)
+    # --- Title / role matching ---
+    query_title = norm(job_title)
+    # Exact phrase match (highest signal)
+    if re.search(r"\b" + re.escape(query_title) + r"\b", title):
+        score += 120
+    elif re.search(r"\b" + re.escape(query_title) + r"\b", combined):
+        score += 60
 
-        # Hard kill if not found
-        if not location_found:
+    # token-level matching
+    query_tokens = [t for t in re.split(r"\s+", query_title) if len(t) > 2]
+    token_matches = 0
+    for tok in query_tokens:
+        if re.search(r"\b" + re.escape(tok) + r"\b", title):
+            score += 30
+            token_matches += 1
+        elif re.search(r"\b" + re.escape(tok) + r"\b", combined):
+            score += 12
+            token_matches += 1
+
+    # If none of the title tokens appear anywhere, it's unlikely relevant
+    if token_matches == 0:
+        # small chance it's a match if "ai" is requested in title and present in snippet
+        if "ai" in query_title and "ai" in combined:
+            score += 8
+        else:
+            # keep a tiny score so other checks can still consider it (you can raise this later)
+            score += 0
+
+    # Title aliasing (common synonyms)
+    aliases = []
+    qlow = query_title
+    if "machine learning" in qlow or "ml" in qlow:
+        aliases += ["machine learning engineer", "ml engineer", "mle", "ml scientist"]
+    if "ai" in qlow or "artificial intelligence" in qlow:
+        aliases += ["ai engineer", "applied ai", "llm engineer", "generative ai engineer", "genai"]
+    # check aliases
+    for a in set(aliases):
+        if re.search(r"\b" + re.escape(a) + r"\b", combined):
+            score += 40
+
+    # --- Experience enforcement (STRICT when user asks) ---
+    combined_tokens = combined  # already normalized
+    SENIOR_MARKERS = [r"\bsenior\b", r"\bsr\b", r"\bsr\.\b", r"\blead\b", r"\bprincipal\b", r"\bstaff\b"]
+    MID_MARKERS = [r"\bmid\b", r"\bexperienced\b", r"\b(3|4|5)\+?\s?years\b"]
+    JUNIOR_MARKERS = [r"\bjunior\b", r"\bentry\b", r"\bassociate\b", r"\bgraduate\b", r"\bintern\b", r"\b1-2\b"]
+
+    def has_any(patterns):
+        return any(re.search(p, combined_tokens) for p in patterns)
+
+    exp_req = (exp_level or "any").lower().strip()
+    if exp_req == "senior":
+        # require explicit senior marker somewhere (title or snippet)
+        if not has_any(SENIOR_MARKERS):
+            return 0
+        else:
+            score += 50
+    elif exp_req in ("mid", "mid-level", "mid level", "midlevel"):
+        if has_any(SENIOR_MARKERS):
+            score += 10  # it's okay if senior; still acceptable
+        elif has_any(MID_MARKERS) or not has_any(JUNIOR_MARKERS):
+            score += 25
+        else:
+            # deprioritize explicit junior postings
+            score -= 30
+    elif exp_req in ("junior", "entry"):
+        if has_any(JUNIOR_MARKERS):
+            score += 30
+        elif has_any(SENIOR_MARKERS):
+            return 0  # user asked junior but posting is senior -> reject
+        else:
+            score += 5
+
+    # --- Location strictness (keep your strict rules but normalize) ---
+    if location and location.lower() not in ("any", "anywhere"):
+        loc_norm = location.lower().replace(",", "").strip()
+        # check multi-word location (city + state)
+        loc_words = [w for w in re.split(r"\s+", loc_norm) if w]
+        found_loc = False
+        # check for exact phrase (city + state) first
+        if re.search(r"\b" + re.escape(loc_norm) + r"\b", combined):
+            found_loc = True
+            score += 60
+        else:
+            # check tokens (NY, nyc, new york)
+            for lw in loc_words:
+                if len(lw) > 2 and re.search(r"\b" + re.escape(lw) + r"\b", combined):
+                    found_loc = True
+                    score += 20
+        # check US state abbrev mapping too (small boost)
+        STATE_ABBR = {"new york": "ny", "california":"ca", "massachusetts":"ma", "illinois":"il", "texas":"tx"}
+        abbr = STATE_ABBR.get(loc_norm)
+        if abbr and re.search(r"\b" + re.escape(abbr) + r"\b", combined):
+            found_loc = True
+            score += 12
+
+        if not found_loc:
+            # If user requested a strict location and no location mention, reject
             return 0
 
-        # Penalize competing US cities/states
-        US_LOCATIONS = [s for s in STATE_ABBR.keys() if s != loc_normalized]
-        for us_loc in US_LOCATIONS:
-            if us_loc in combined and us_loc not in loc_variants:
-                score -= 50
+        # penalize if other major competing states are present
+        competing = ["california", "palo alto", "san francisco", "austin", "boston", "seattle", "chicago"]
+        for c in competing:
+            if c in combined and c not in loc_norm:
+                score -= 40
 
-        # Hard kill foreign locations
-        FOREIGN_LOCS = ["india","delhi","munich","germany","london","europe","asia","canada"]
-        if any(f in combined for f in FOREIGN_LOCS):
-            return 0
+        # remote posts: if title/snippet says remote but user specified location, deprioritize
+        if ("remote" in title or "remote" in snippet or "work from home" in snippet) and loc_norm not in ("remote","anywhere"):
+            score -= 20
 
-        # Remote handling
-        if any(x in title for x in ["remote","wfh"]) and "remote" not in loc_normalized:
-            score -= 15
-
-    # -----------------------------
-    # 3. Experience level
-    # -----------------------------
-    if exp_level:
-        exp_lower = exp_level.lower()
-        if "junior" in exp_lower or "entry" in exp_lower:
-            if any(x in combined for x in ["senior","sr.","lead","principal","director","manager", "Senior", "Sr.", "Lead", "Principal", "Director", "Manager"]):
-                score -= 50
-            if any(x in combined for x in ["junior","entry","associate","early career", "entry level", "intern"]):
-                score += 10
-        elif "senior" in exp_lower:
-            if any(x in combined for x in ["junior","entry","intern","associate"]):
-                score -= 50
-            if any(x in combined for x in ["senior","sr.","lead","principal"]):
-                score += 10
-
-    # -----------------------------
-    # 4. Salary indicators
-    # -----------------------------
+    # --- Salary (small boost) ---
     if min_salary:
-        salary_match = re.search(r'\$?(\d{2,3})k|\$(\d{3,3},\d{3})', combined)
-        if salary_match:
+        # robust salary search: $120k, 120k, $120,000
+        m = re.search(r"\$?(\d{2,3})k\b|\$(\d{3,3},\d{3})", raw_snippet, flags=re.IGNORECASE)
+        if m:
             try:
-                raw_salary = salary_match.group(1) or salary_match.group(2)
-                found_salary = int(raw_salary.replace('k','000').replace(',',''))
-                if found_salary >= min_salary:
-                    score += 10
+                raw = m.group(1) or m.group(2)
+                found = int(str(raw).replace("k","000").replace(",",""))
+                if found >= min_salary:
+                    score += 12
             except:
                 pass
 
-    # -----------------------------
-    # 5. Negative signals
-    # -----------------------------
-    if any(neg in combined for neg in ["expired","closed","filled","no longer accepting",
-                                       "sorry this job is no longer available", "is no longer available for applications"]):
-        return 0
+    # final safety: keep non-negative
+    return max(0, int(score))
 
-    return max(0, score)
-
-# Playwright validation functions (no changes needed, kept optimized)
+# Playwright validation functions
 def validate_job_playwright_fast(job_url: str) -> bool:
     """Tier 1: Fast check using only title/closed selectors after aggressive resource blocking."""
     if not sync_playwright: return True 
@@ -338,8 +455,33 @@ def validate_job_playwright_full(job_url: str, job_title: str) -> Optional[Dict[
         
         # Get title
         title = page.title() or job_title
-        page.close()
         
+        # Additional validation checks
+        try:
+            page_text = page.inner_text('body')[:500].lower() if page.locator('body').count() > 0 else ""
+        except:
+            page_text = ""
+
+        # Check for non-job page indicators
+        BAD_PAGE_INDICATORS = [
+            "search results", "job search", "browse jobs", "find jobs",
+            "salary information", "average salary", "career advice",
+            "discussion", "forum", "community", "profile"
+        ]
+
+        if any(indicator in page_text for indicator in BAD_PAGE_INDICATORS):
+            page.close()
+            return None
+
+        # Must have "apply" or "job description" or similar on actual job pages
+        GOOD_PAGE_INDICATORS = ["apply", "description", "responsibilities", "qualifications", "requirements"]
+        has_good_indicator = any(indicator in page_text for indicator in GOOD_PAGE_INDICATORS)
+
+        if not has_good_indicator:
+            page.close()
+            return None
+        
+        page.close()
         return {"title": title[:150], "url": job_url}
         
     except Exception:
@@ -405,27 +547,197 @@ Query: {query}"""
     exp_term = f'"{exp_level}"' if exp_level.lower() != "any" else ""
     base_query = f'"{job_title}" {exp_term} {loc_term}'.strip()
     
+    # MASSIVELY EXPANDED: 6 -> 20 variants
     variants = [
         base_query,
+        f'{base_query} hiring',
+        f'{base_query} jobs',
+        f'{base_query} careers',
+        f'{base_query} apply',
+        f'{base_query} openings',
         f'{base_query} hiring now',
         f'{base_query} current openings',
         f'{base_query} apply now',
-        f'{base_query} careers',
         f'{base_query} job listing',
+        f'{base_query} open positions',
+        f'{base_query} we are hiring',
+        f'{base_query} employment',
+        f'{base_query} vacancies',
+        f'{base_query} opportunities',
+        f'{base_query} positions available',
+        f'{base_query} now accepting applications',
+        f'{base_query} join our team',
+        f'{base_query} work with us',
+        f'{base_query} career opportunities',
     ]
     
+    # MASSIVELY EXPANDED: 50+ -> 100+ sites
     sites = [
+        # Major Job Boards
         'linkedin.com/jobs/view',
+        'linkedin.com/jobs/collections',
+        'indeed.com/viewjob',
+        'indeed.com/rc/clk',
+        'indeed.com/pagead/clk',
+        'glassdoor.com/job-listing',
+        'glassdoor.com/partner/jobListing',
+        'ziprecruiter.com/c/',
+        'ziprecruiter.com/jobs/',
+        'monster.com/job-openings',
+        'careerbuilder.com/job',
+        'dice.com/jobs/detail',
+        'dice.com/job-detail',
+        'simplyhired.com/job',
+        'careerjet.com/jobad',
+        'adzuna.com/details',
+        'adzuna.com/land',
+        'theladders.com/job',
+        'snagajob.com/jobs',
+        
+        # Tech Job Boards
+        'builtin.com/job',
+        'stackoverflow.com/jobs',
+        'stackoverflowjobs.com',
+        'angel.co/jobs',
         'wellfound.com/jobs',
-        'dice.com/job-detail','careerbuilder.com/job','remotely.jobs/show',
-        'simplyhired.com/job','careerjet.com/jobad',
-        'adzuna.com/details', 'builtin.com/job', 'jobsgpt.org/show', 'glassdoor.com/job-listing', 'theladders.com/job', 'jobright.ai/jobs/info'
+        'wellfound.com/l/',
+        'ycombinator.com/companies',
+        'workatastartup.com/jobs',
+        'hired.com/jobs',
+        'techmasters.com/jobs',
+        'cybercoders.com/job',
+        'jobright.ai/jobs',
+        'jobsgpt.org/show',
+        
+        # Remote Job Boards
+        'weworkremotely.com/remote-jobs',
+        'remotive.com/remote-jobs',
+        'remoteok.com/remote-jobs',
+        'flexjobs.com/jobs',
+        'remote.co/job',
+        'jobspresso.co/job',
+        'remoteworkhub.com',
+        'himalayas.app/jobs',
+        'himalayas.app/companies',
+        'arc.dev/remote-jobs',
+        'justremote.co/remote-jobs',
+        'remotely.jobs/show',
+        'powertofly.com/jobs',
+        'dynamitejobs.com/remote-jobs',
+        'nodesk.co/remote-jobs',
+        
+        # Niche/Industry Boards
+        'icrunchdata.com/jobs',
+        'ai-jobs.net/jobs',
+        'mlconf.com/jobs',
+        'techcareers.com/jobs',
+        'engineerjobs.com',
+        'angelhire.com/jobs',
+        'techinasia.com/jobs',
+        'geekwire.com/jobs',
+        
+        # ATS Platforms (HIGH VALUE)
+        'jobs.lever.co',
+        'boards.greenhouse.io',
+        'jobs.ashbyhq.com',
+        'apply.workable.com',
+        'careers.smartrecruiters.com',
+        'jobs.icims.com/jobs',
+        'jobs.jobvite.com',
+        'recruiting.ultipro.com',
+        'careers.pageuppeople.com',
+        'successfactors.com/career',
+        'taleo.net/careersection',
+        'myworkdayjobs.com',
+        'bamboohr.com/jobs',
+        'breezy.hr',
+        'recruiterbox.com',
+        
+        # Company Domains (Broad Patterns)
+        'careers.', 
+        'jobs.',
+        '/careers/',
+        '/jobs/',
+        '/job/',
+        '/opportunities/',
+        '/positions/',
+        '/openings/',
+        '/join-us/',
+        '/work-with-us/',
+        '/employment/',
+        '/vacancies/',
+        
+        # Big Tech (HIGH VALUE)
+        'careers.google.com/jobs',
+        'careers.microsoft.com',
+        'metacareers.com/jobs',
+        'amazon.jobs/en/jobs',
+        'jobs.apple.com/en-us/details',
+        'nvidia.wd5.myworkdayjobs.com',
+        'tesla.com/careers',
+        'openai.com/careers',
+        'anthropic.com/careers',
+        'salesforce.com/careers',
     ]
 
-    sources = [f"{v} site:{s}" for v in variants for s in sites]
+    # MULTI-STRATEGY APPROACH FOR MAXIMUM COVERAGE
+    
+    # Strategy 1: Site-specific searches (use first 40 sites to avoid too many queries)
+    site_queries = [f"{v} site:{s}" for v in variants[:10] for s in sites[:40]]
+    
+    # Strategy 2: Broad searches on major platforms (no site restrictions)
+    broad_queries = [
+        f'{base_query}',
+        f'{base_query} site:linkedin.com',
+        f'{base_query} site:indeed.com',
+        f'{base_query} site:glassdoor.com',
+        f'{base_query} site:ziprecruiter.com',
+        f'{base_query} site:dice.com',
+        f'{base_query} site:monster.com',
+        f'{job_title} {location} jobs',
+        f'{job_title} {location} careers',
+        f'{job_title} {location} hiring',
+        f'{job_title} {location} openings',
+        f'{job_title} {location} employment',
+        f'{job_title} {location} positions',
+        f'hiring {job_title} {location}',
+        f'apply {job_title} {location}',
+    ]
+    
+    # Strategy 3: URL pattern searches (inurl, intitle)
+    pattern_queries = [
+        f'"{job_title}" {loc_term} inurl:job',
+        f'"{job_title}" {loc_term} inurl:career',
+        f'"{job_title}" {loc_term} inurl:apply',
+        f'"{job_title}" {loc_term} inurl:position',
+        f'"{job_title}" {loc_term} inurl:opening',
+        f'"{job_title}" {loc_term} inurl:hiring',
+        f'"{job_title}" {loc_term} intitle:job',
+        f'"{job_title}" {loc_term} intitle:career',
+        f'{job_title} {location} inurl:jobs',
+        f'{job_title} {location} inurl:careers',
+    ]
+    
+    # Strategy 4: ATS-specific deep searches
+    ats_queries = [
+        f'{base_query} site:lever.co',
+        f'{base_query} site:greenhouse.io',
+        f'{base_query} site:ashbyhq.com',
+        f'{base_query} site:workable.com',
+        f'{base_query} site:icims.com',
+        f'{base_query} site:jobvite.com',
+        f'{base_query} site:myworkdayjobs.com',
+        f'{base_query} site:smartrecruiters.com',
+    ]
+    
+    # Combine ALL strategies
+    sources = site_queries + broad_queries + pattern_queries + ats_queries
     random.shuffle(sources)
+    
+    logging.info(f"Generated {len(sources)} total search queries")
 
     # --- 3. FETCH DDG RESULTS WITH DEDUPLICATION ---
+    # MASSIVELY INCREASED
     results_raw = []
     seen_urls = set()
 
@@ -436,15 +748,27 @@ Query: {query}"""
         temp_results = []
         try:
             with DDGS() as ddgs:
-                time.sleep(random.uniform(0.5,1.5))
-                for r in ddgs.text(search_query, max_results=500):
+                time.sleep(random.uniform(0.2, 0.8))  # Faster fetching
+                # MASSIVELY INCREASED: 800 -> 3000
+                for r in ddgs.text(search_query, max_results=3000):
                     r['source_query'] = search_query
                     temp_results.append(r)
         except Exception as e:
-            print(f"DDG error for {search_query}: {e}")
+            logging.warning(f"DDG error for {search_query}: {e}")
+            # Retry with simpler query
+            try:
+                time.sleep(0.5)
+                simple_query = search_query.split('site:')[0].strip()
+                with DDGS() as ddgs:
+                    for r in ddgs.text(simple_query, max_results=1500):
+                        r['source_query'] = search_query
+                        temp_results.append(r)
+            except:
+                pass
         return temp_results
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    # MASSIVELY INCREASED: 8 -> 20 workers for aggressive parallel fetching
+    with ThreadPoolExecutor(max_workers=20) as executor:
         futures = [executor.submit(fetch_ddg_results, q) for q in sources]
         for f in as_completed(futures):
             for r in f.result():
@@ -456,8 +780,24 @@ Query: {query}"""
                     continue
                 seen_urls.add(url_norm)
 
-                # broad acceptance
-                if not re.search(r"/(job|jobs|career|careers|position|vacancy|opportunit|apply|role|opening|work|join)", url.lower()):
+                # Filter out non-job URLs
+                BAD_PATTERNS = [
+                    r'fishbowlapp\.com',  # Forum posts, not job listings
+                    r'salary',  # Salary pages
+                    r'career/[^/]+/salaries',  # Salary info pages
+                    r'/in/[a-z]+-[a-z]+-\d+',  # LinkedIn profiles (not job posts)',
+                    r'linkedin\.com/in/',  # LinkedIn profiles
+                    r'bebee\.com',  # Often aggregator spam
+                    r'corptocorp\.org',  # C2C spam
+                    r'moaijobs\.com',  # Aggregator with poor quality
+                    r'/q-[^/]+-jobs\.html',  # Indeed search results pages
+                    r'/jobs/\?',  # Generic job search pages (not specific listings)
+                    r'hireaniner\.charlotte\.edu',  # University job boards (not target)
+                    r'reddit\.com',  # Forum posts
+                    r'quora\.com',  # Q&A site
+                ]
+
+                if any(re.search(pattern, url.lower()) for pattern in BAD_PATTERNS):
                     continue
 
                 results_raw.append({
@@ -466,20 +806,24 @@ Query: {query}"""
                     "snippet": r.get("body",""),
                     "source_query": r.get("source_query")
                 })
+    
+    logging.info(f"Collected {len(results_raw)} raw results from {len(sources)} sources")
 
     if not results_raw:
         return f"⚠️ No results found for '{job_title}' in '{location}' (Raw count: 0)"
 
     # --- 4. SCORE AND FILTER ---
     scored_jobs = []
-    MIN_RELEVANCE_SCORE = 5
+    # REDUCED: 10 -> 2 (more lenient to get more candidates)
+    MIN_RELEVANCE_SCORE = 2
     for job in results_raw:
         score = score_job_relevance(job, job_title, location, exp_level, min_salary)
         if score > MIN_RELEVANCE_SCORE:
             scored_jobs.append((score, job))
     scored_jobs.sort(key=lambda x: x[0], reverse=True)
     
-    candidates_for_validation = [job for _, job in scored_jobs[:desired_count*60]]
+    # MASSIVELY INCREASED: desired_count*60 -> desired_count*500
+    candidates_for_validation = [job for _, job in scored_jobs[:desired_count*500]]
     if not candidates_for_validation:
         return f"⚠️ No relevant jobs found after filtering '{job_title}' in '{location}' (Scored count: {len(scored_jobs)})"
 
@@ -493,26 +837,31 @@ Query: {query}"""
     def validate_job_wrapper_fast(job_data):
         return job_data if validate_job_playwright_fast(job_data["url"]) else None
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # INCREASED: 8 -> 16 workers
+    with ThreadPoolExecutor(max_workers=16) as executor:
         futures = {executor.submit(validate_job_wrapper_fast, job): job for job in candidates_for_validation}
         for future in as_completed(futures):
             result = future.result()
             if result:
                 fast_validated_jobs.append(result)
-                if len(fast_validated_jobs) >= desired_count*4:
+                # MASSIVELY INCREASED: desired_count*9 -> desired_count*20
+                if len(fast_validated_jobs) >= desired_count*30:
                     [f.cancel() for f in futures if not f.done()]
                     break
 
     # --- 6. FULL VALIDATION ---
-    final_candidates = fast_validated_jobs[:desired_count+55]
+    # MASSIVELY INCREASED: desired_count+100 -> desired_count*5
+    final_candidates = fast_validated_jobs[:desired_count*5]
     validated_jobs = []
     def validate_job_wrapper_full(job_data):
         return validate_job_playwright_full(job_data["url"], job_data.get("title","Job Posting"))
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # INCREASED: 8 -> 16 workers
+    with ThreadPoolExecutor(max_workers=16) as executor:
         futures = {executor.submit(validate_job_wrapper_full, job): job for job in final_candidates}
         for future in as_completed(futures):
-            if len(validated_jobs) >= desired_count:
+            # CRITICAL: Keep collecting until we have 2x desired to ensure we hit the target
+            if len(validated_jobs) >= desired_count * 2:
                 [f.cancel() for f in futures if not f.done()]
                 break
             result = future.result()
@@ -528,7 +877,30 @@ Query: {query}"""
             continue
         seen_final_urls.add(url_norm)
         final_jobs.append(job)
-    final_jobs = final_jobs[:desired_count]
+    
+    # Final cleanup: Remove any remaining low-quality results
+    filtered_final = []
+    for job in final_jobs:
+        url = job.get("url", "").lower()
+        title = job.get("title", "").lower()
+        
+        # Skip if title looks like a salary page or search result
+        if any(x in title for x in ["salary", "salaries", "jobs in", "hiring ", "employment |", "job listings |"]):
+            continue
+        
+        # Skip if URL is clearly not a job posting
+        if any(x in url for x in ["fishbowl", "salary", "bebee", "corptocorp", "moaijobs"]):
+            continue
+        
+        # Must have the job role in title
+        job_title_lower = job_title.lower()
+        title_tokens = job_title_lower.split()
+        if not any(token in title for token in title_tokens if len(token) > 2):
+            continue
+        
+        filtered_final.append(job)
+
+    final_jobs = filtered_final[:desired_count]
 
     elapsed = time.time() - start
     if not final_jobs:
@@ -549,7 +921,7 @@ Query: {query}"""
         title = job.get("title","Job Posting")
         url = job.get("url","")
         if title and url:
-            out.append(f"{i}. **{title}** \n   {url}\n")
+            out.append(f"{i}. **{title}**\n   {url}\n")
 
     if len(final_jobs) < desired_count:
         out.append(f"\n⚠️ Found {len(final_jobs)}/{desired_count} jobs. Searched {len(results_raw)} raw links, filtered to {len(scored_jobs)} candidates.")
@@ -567,7 +939,6 @@ Query: {query}"""
     return "\n".join(out)
 
 # ============ WEB SEARCH ============
-# ... (Remains the same as no significant speedup can be achieved without caching LLM response) ...
 def web_search(query: str) -> str:
     if not DDGS: return "⚠️ ddgs package not installed."
     if not llm: return "⚠️ LLM not available."
@@ -655,7 +1026,6 @@ Text to Summarize:
         return f"⚠️ Failed: {e}"
 
 # ============ EMAIL ============
-# ... (Remains the same) ...
 def send_email(subject: str, body: str, recipient_email: str) -> str:
     if not SENDER_EMAIL or not SENDER_PASSWORD:
         return "❌ Failed: SENDER_EMAIL or SENDER_APP_PASSWORD not configured."
