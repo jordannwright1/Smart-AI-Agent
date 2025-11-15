@@ -52,7 +52,7 @@ SENDER_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
 # ============ STREAMLIT SETUP ============
 st.set_page_config(page_title="Smart AI Agent", layout="wide")
 st.title("🤖 LangGraph AI Agent")
-st.write("Enhanced AI Agent: Multi-source job search with advanced filtering, web search and scraping, and sends emails.  Job search may take 5-6 minutes. Try 'Find 20 AI Engineer positions in NYC'")
+st.write("Enhanced AI Agent: Multi-source job search with advanced filtering, web search, scraping, and sends emails.  Job search may take 5-6 minutes. Try 'Find 20 AI Engineer positions in NYC'")
 
 # ============ LLM SETUP ============
 if ChatOllama:
@@ -1189,7 +1189,7 @@ else:
 # STREAMLIT OUTPUT CLEANUP
 # --------------------------
 query = st.text_area("Enter your request:", height=120)
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 run_button_clicked = col1.button("Run Agent")
 
 if run_button_clicked and app:
@@ -1210,15 +1210,3 @@ elif run_button_clicked and not app:
 
 if col2.button("Clear Memory"):
     clear_memory()
-
-if col3.button("Close Browser"):
-    if st.session_state.get("browser_manager"):
-        try:
-            st.session_state["browser_manager"].close()
-            st.session_state["browser_manager"] = None
-            st.success("Browser closed.")
-        except Exception:
-            st.warning("Browser was already closed or failed to close gracefully.")
-            st.session_state["browser_manager"] = None
-    else:
-        st.info("Browser is not currently running.")
